@@ -1,6 +1,6 @@
 # Sigma MoE 🤗
 This is a huggingface-like implementation of the Sigma-MoE architecture proposed by [Csordas et al.](https://aclanthology.org/2023.findings-emnlp.49/).
-All of the features of huggingface are supported and we have pre-trained models available in the HF organization of the Analog In-Memory Computing Group of IBM Research -- Zurich, which can be found [here](https://huggingface.co/ibm-aimc).
+All of the features of huggingface are supported and we have pre-trained models available in the HF organization of the Analog In-Memory Computing Group of IBM Research - Zurich, which can be found [here](https://huggingface.co/ibm-aimc).
 
 ## Requirements
 The Sigma-MoE layer also has a CPU implementation. If you are running it on a GPU, you need to have one which is at least Volta (V100, A100, H100) since this package leverages triton.
