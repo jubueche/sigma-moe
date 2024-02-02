@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sigma_moe import SigmaMoEForCausalLM
-from transformers import AutoTokenizer
+
 
 IS_CUDA = torch.cuda.is_available()
 
