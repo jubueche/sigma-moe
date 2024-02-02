@@ -43,7 +43,8 @@ def main():
     # load the model from the hub
     model = SigmaMoEForCausalLM.from_pretrained("ibm-aimc/sigma-moe-small")
     model = model.eval()
-    model.cuda()
+    if IS_CUDA:
+        model.cuda()
 
     # load the tokenizer (sentencepiece)
     tokenizer = AutoTokenizer.from_pretrained("ibm-aimc/sigma-moe-small")
