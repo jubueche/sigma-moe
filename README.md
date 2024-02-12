@@ -32,7 +32,7 @@ from sigma_moe import SigmaMoEPreTrainedModel
 For an example, see `example.py`.
 
 ## Note on `torch.compile`
-This layer supports `torch.compile`.
+This layer currently does not support `torch.compile`, but we are working on fixing that.
 
 ## License
 ```

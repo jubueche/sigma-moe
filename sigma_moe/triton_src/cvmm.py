@@ -632,8 +632,6 @@ class CVMM(torch.autograd.Function):
         if reduction_weight is not None:
             res_into_reduction = res.view(*reduction_weight.shape, res.shape[-1])
             res = (reduction_weight.unsqueeze(-2).type_as(res) @ res_into_reduction).squeeze(-2)
-        else:
-            res_into_reduction = None
 
         ctx.save_for_backward(
             x,
@@ -642,7 +640,6 @@ class CVMM(torch.autograd.Function):
             sel_index,
             None if out_index_is_none else out_index,
             reduction_weight,
-            res_into_reduction,
         )
         ctx.op_type = out_type
         ctx.keys_type = keys.dtype
@@ -651,7 +648,7 @@ class CVMM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, keys, sel, sel_index, out_index, reduction_weight, res_into_reduction = ctx.saved_tensors
+        x, keys, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
         keys_dt = keys
 
         # Backward for weight
@@ -704,11 +701,13 @@ class CVMM(torch.autograd.Function):
             grad_x = (
                 reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full
             ).squeeze(-2)
-            grad_w_off = (
-                (res_into_reduction.type_as(reduction_weight) @ grad_output.unsqueeze(-1).type_as(reduction_weight))
-                .squeeze(-1)
-                .view_as(reduction_weight)
-            )
+            # equivalent, but uses more memory
+            # grad_w_off = (
+            #     (res_into_reduction.type_as(reduction_weight) @ grad_output.unsqueeze(-1).type_as(reduction_weight))
+            #     .squeeze(-1)
+            #     .view_as(reduction_weight)
+            # )
+            grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
         elif grad_x_full.shape[-2] != 1:
             grad_x = grad_x_full.sum(-2)
         else:
@@ -778,7 +777,6 @@ if __name__ == "__main__":
             return out
 
     model = Model().to(torch.float16).cuda()
-    model = torch.compile(model)
 
     torch.manual_seed(0)
     n_experts = 8
