@@ -1,4 +1,7 @@
 import math
+import re
+from collections import OrderedDict
+from functools import partial
 from typing import Optional, Tuple, Union
 
 from transformers.utils import is_torch_available
@@ -8,6 +11,7 @@ if is_torch_available():
     import torch
     import torch.distributed
     import torch.nn.functional as F
+    from torch import zeros, randn
 
 
 def is_at_least_volta_gpu():
@@ -69,6 +73,55 @@ def entropy_l(l: torch.Tensor) -> torch.Tensor:
     return -(l * l.exp()).sum(-1)
 
 
+def non_traceable_to_traceable(state_dict: OrderedDict, prefix: str):
+    """Convert non-traceable state dict into traceable state dict in-place"""
+    keys_to_delete = [prefix + "keys", prefix + "values"]
+    keys = state_dict[prefix + "keys"]
+    values = state_dict[prefix + "values"]
+    bias = None
+    if prefix + "bias" in state_dict:
+        keys_to_delete.append(prefix + "bias")
+        bias = state_dict[prefix + "bias"]
+    n_experts = len(keys)
+    for i in range(n_experts):
+        state_dict[prefix + f"keys.{i}.weight"] = keys[i].T
+        state_dict[prefix + f"values.{i}.weight"] = values[i].T
+        if bias is not None:
+            state_dict[prefix + f"keys.{i}.bias"] = bias[i]
+    state_dict[prefix + "expert_sel.weight"] = state_dict[prefix + "expert_sel.weight"]
+    for key_to_delete in keys_to_delete:
+        state_dict.pop(key_to_delete)
+
+
+def traceable_to_non_traceable(state_dict: OrderedDict, prefix: str):
+    """Convert traceable to non-traceable state dict"""
+    key_names = [k for k in state_dict if re.match(rf"^{re.escape(prefix)}keys\.\d+\.weight$", k)]
+    key_biases = [k for k in state_dict if re.match(rf"^{re.escape(prefix)}keys\.\d+\.bias$", k)]
+    values_names = [k for k in state_dict if re.match(rf"^{re.escape(prefix)}values\.\d+\.weight$", k)]
+    keys_to_delete = [*key_names, *values_names, *key_biases]
+    bias = None
+    if prefix + "keys.0.bias" in state_dict:
+        bias = torch.stack([state_dict[k] for k in key_biases])
+        state_dict[prefix + "bias"] = bias
+    state_dict[prefix + "keys"] = torch.stack([state_dict[k] for k in key_names]).transpose(2, 1)
+    state_dict[prefix + "values"] = torch.stack([state_dict[k] for k in values_names]).transpose(2, 1)
+    state_dict[prefix + "expert_sel.weight"] = state_dict[prefix + "expert_sel.weight"]
+    for key_to_delete in keys_to_delete:
+        state_dict.pop(key_to_delete)
+
+
+def load_state_dict_pre_hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs, traceable):
+    if prefix + "keys" in state_dict:
+        state_dict_is_for_non_traceable = True
+    else:
+        state_dict_is_for_non_traceable = False
+
+    if traceable and state_dict_is_for_non_traceable:
+        # convert state dict to traceable
+        non_traceable_to_traceable(state_dict=state_dict, prefix=prefix)
+    elif not traceable and not state_dict_is_for_non_traceable:
+        traceable_to_non_traceable(state_dict=state_dict, prefix=prefix)
+
 class SigmaMoELayer(torch.nn.Module):
     def __init__(
         self,
@@ -84,6 +137,7 @@ class SigmaMoELayer(torch.nn.Module):
         v_dim: Optional[int] = None,
         sinkhorn_n_iters: int = 3,
         expert_dropout: float = 0.0,
+        traceable: bool = False
     ):
         super().__init__()
         self.k_dim = d_model
@@ -99,20 +153,49 @@ class SigmaMoELayer(torch.nn.Module):
         self.activation = activation
         self.sinkhorn_n_iters = sinkhorn_n_iters
         self.expert_dropout = expert_dropout
+        self.traceable = traceable
 
         if self.selection_mode not in {"softmax", "sigmoid", "sinkmoid"}:
             raise ValueError(f"Unknown selection mode {self.selection_mode}")
 
-        self.keys = torch.nn.Parameter(torch.randn(self.n_experts, self.k_vec_dim, self.expert_size))
-        self.values = torch.nn.Parameter(torch.randn(self.n_experts, self.expert_size, self.v_dim))
         self.expert_sel = torch.nn.Linear(in_features=self.k_vec_dim, out_features=self.n_experts, bias=False)
 
-        if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(self.n_experts, self.expert_size))
-            self.o_bias = torch.nn.Parameter(torch.zeros(self.v_dim))
+        self._register_load_state_dict_pre_hook(partial(load_state_dict_pre_hook, traceable=traceable))
+
+        if traceable:
+            self.keys = torch.nn.ModuleList(
+                [
+                    torch.nn.Linear(
+                        in_features=self.k_vec_dim,
+                        out_features=self.expert_size,
+                        bias=bias,
+                    )
+                    for _ in range(self.n_experts)
+                ]
+            )
+            self.values = torch.nn.ModuleList(
+                [
+                    torch.nn.Linear(
+                        in_features=self.expert_size,
+                        out_features=self.k_vec_dim,
+                        bias=False,
+                    )
+                    for _ in range(self.n_experts)
+                ]
+            )
+            if bias:
+                self.o_bias = torch.nn.Parameter(zeros(self.v_dim))
+            else:
+                self.o_bias = None
         else:
-            self.bias = None
-            self.o_bias = None
+            self.keys = torch.nn.Parameter(randn(self.n_experts, self.k_vec_dim, self.expert_size))
+            self.values = torch.nn.Parameter(randn(self.n_experts, self.expert_size, self.v_dim))
+            if bias:
+                self.bias = torch.nn.Parameter(zeros(self.n_experts, self.expert_size))
+                self.o_bias = torch.nn.Parameter(zeros(self.v_dim))
+            else:
+                self.bias = None
+                self.o_bias = None
 
     def renorm_keep_std(self, weight: torch.Tensor, dim: int = 0):
         with torch.no_grad():
@@ -184,8 +267,8 @@ class SigmaMoELayer(torch.nn.Module):
         # Based on https://arxiv.org/abs/2202.01169. Unnormalized verison
         A, B = x.shape[-2:]
 
-        a = torch.zeros_like(x[..., 0, :])
-        b = torch.zeros_like(x[..., 0])
+        a = zeros_like(x[..., 0, :])
+        b = zeros_like(x[..., 0])
 
         for _ in range(self.sinkhorn_n_iters):
             b = math.log(A) - (x - a[..., None, :]).logsumexp(-1)

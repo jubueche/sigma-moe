@@ -44,6 +44,7 @@ class SigmaMoEConfiguration(PretrainedConfig):
         qk_layernorm: bool = False,
         routing_regularization: float = 0.001,
         num_sparse_hidden_layers: int = None,
+        traceable: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -86,6 +87,7 @@ class SigmaMoEConfiguration(PretrainedConfig):
         else:
             # this will create no sparse layers
             self.sparse_step = -1
+        self.traceable = traceable
 
         self._rope_scaling_validation()
 
