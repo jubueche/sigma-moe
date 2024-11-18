@@ -264,7 +264,7 @@ class SigmaMoELayer(torch.nn.Module):
     def compute_scores_traceable(
         self, inp: torch.Tensor, index: torch.Tensor
     ) -> torch.Tensor:
-        # TODO implementing sorting
+        
         bsz, seq_len, d_model = inp.shape
         scores = torch.zeros((bsz, seq_len, self.expert_size)).to(inp.device)
         scores = scores.view(-1, self.expert_size)
@@ -278,16 +278,7 @@ class SigmaMoELayer(torch.nn.Module):
                 )
         scores = scores.view(bsz, seq_len, self.expert_size)
         scores = F.relu(scores)
-
-        # # per token. very poor performance
-        # bsz, seq_len, _ = inp.shape
-        # scores = torch.zeros((bsz, seq_len, self.expert_size)).to(inp.device)
-        # for b in range(bsz):
-        #     for s in range(seq_len):
-        #         token = inp[b, s]
-        #         expert_idx = index[b, s]
-        #         scores[b, s] = self.keys[expert_idx](token)
-        # scores = F.relu(scores)
+        
         return scores
 
     def compute_scores(
@@ -461,19 +452,6 @@ class SigmaMoELayer(torch.nn.Module):
             ]
 
             # Down projection layer for each head
-            # # per token. poor performance.
-            # res = torch.zeros_like(inp)
-            # bsz, seq_len, _ = inp.shape
-            # for h, scores in enumerate(scores_l):
-            #     sel_index_h = sel_index[..., h]
-            #     sel_val_h = sel_val[..., h]
-            #     for b in range(bsz):
-            #         for s in range(seq_len):
-            #             expert_idx = sel_index_h[b, s]
-            #             res[b, s] = res[b, s] + sel_val_h[b, s] * self.values[expert_idx](
-            #                 scores[b, s]
-            #             )
-
             res = torch.zeros_like(inp)
             bsz, seq_len, d_model = inp.shape
             res = res.view(-1, d_model)
