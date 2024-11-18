@@ -1,4 +1,7 @@
 import math
+import re
+from collections import OrderedDict
+from functools import partial
 from typing import Optional, Tuple, Union
 
 from transformers.utils import is_torch_available
@@ -8,6 +11,7 @@ if is_torch_available():
     import torch
     import torch.distributed
     import torch.nn.functional as F
+    from torch import zeros, randn, zeros_like
 
 
 def is_at_least_volta_gpu():
@@ -18,19 +22,21 @@ def is_at_least_volta_gpu():
     return False
 
 
-IS_TRITON = False
+TRITON_AVAIL = False
 try:
     from .triton_src import CVMMSel, cvmm, cvmm_prepare_sel2
 
     if not is_at_least_volta_gpu():
         raise ImportError("GPU must at least be Volta")
-    IS_TRITON = True
+    TRITON_AVAIL = True
 except ImportError:
     from transformers.utils import logging
 
     logger = logging.get_logger(__name__)
     if torch.cuda.is_available():
-        logger.warning("Could not import triton_src.moe_layer.cvmm. Using cuda_src.moe_layer.cvmm instead.")
+        logger.warning(
+            "Could not import triton_src.moe_layer.cvmm. Using cuda_src.moe_layer.cvmm instead."
+        )
     else:
         logger.warning(
             "GPU not available. Falling back to CPU verison of the MoE layer, which is equally fast as a dense layer."
@@ -69,6 +75,77 @@ def entropy_l(l: torch.Tensor) -> torch.Tensor:
     return -(l * l.exp()).sum(-1)
 
 
+def non_traceable_to_traceable(state_dict: OrderedDict, prefix: str):
+    """Convert non-traceable state dict into traceable state dict in-place"""
+    keys_to_delete = [prefix + "keys", prefix + "values"]
+    keys = state_dict[prefix + "keys"]
+    values = state_dict[prefix + "values"]
+    bias = None
+    if prefix + "bias" in state_dict:
+        keys_to_delete.append(prefix + "bias")
+        bias = state_dict[prefix + "bias"]
+    n_experts = len(keys)
+    for i in range(n_experts):
+        state_dict[prefix + f"keys.{i}.weight"] = keys[i].T
+        state_dict[prefix + f"values.{i}.weight"] = values[i].T
+        if bias is not None:
+            state_dict[prefix + f"keys.{i}.bias"] = bias[i]
+    state_dict[prefix + "expert_sel.weight"] = state_dict[prefix + "expert_sel.weight"]
+    for key_to_delete in keys_to_delete:
+        state_dict.pop(key_to_delete)
+
+
+def traceable_to_non_traceable(state_dict: OrderedDict, prefix: str):
+    """Convert traceable to non-traceable state dict"""
+    key_names = [
+        k for k in state_dict if re.match(rf"^{re.escape(prefix)}keys\.\d+\.weight$", k)
+    ]
+    key_biases = [
+        k for k in state_dict if re.match(rf"^{re.escape(prefix)}keys\.\d+\.bias$", k)
+    ]
+    values_names = [
+        k
+        for k in state_dict
+        if re.match(rf"^{re.escape(prefix)}values\.\d+\.weight$", k)
+    ]
+    keys_to_delete = [*key_names, *values_names, *key_biases]
+    bias = None
+    if prefix + "keys.0.bias" in state_dict:
+        bias = torch.stack([state_dict[k] for k in key_biases])
+        state_dict[prefix + "bias"] = bias
+    state_dict[prefix + "keys"] = torch.stack(
+        [state_dict[k] for k in key_names]
+    ).transpose(2, 1)
+    state_dict[prefix + "values"] = torch.stack(
+        [state_dict[k] for k in values_names]
+    ).transpose(2, 1)
+    state_dict[prefix + "expert_sel.weight"] = state_dict[prefix + "expert_sel.weight"]
+    for key_to_delete in keys_to_delete:
+        state_dict.pop(key_to_delete)
+
+
+def load_state_dict_pre_hook(
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+    traceable,
+):
+    if prefix + "keys" in state_dict:
+        state_dict_is_for_non_traceable = True
+    else:
+        state_dict_is_for_non_traceable = False
+
+    if traceable and state_dict_is_for_non_traceable:
+        # convert state dict to traceable
+        non_traceable_to_traceable(state_dict=state_dict, prefix=prefix)
+    elif not traceable and not state_dict_is_for_non_traceable:
+        traceable_to_non_traceable(state_dict=state_dict, prefix=prefix)
+
+
 class SigmaMoELayer(torch.nn.Module):
     def __init__(
         self,
@@ -84,6 +161,7 @@ class SigmaMoELayer(torch.nn.Module):
         v_dim: Optional[int] = None,
         sinkhorn_n_iters: int = 3,
         expert_dropout: float = 0.0,
+        traceable: bool = False,
     ):
         super().__init__()
         self.k_dim = d_model
@@ -99,20 +177,57 @@ class SigmaMoELayer(torch.nn.Module):
         self.activation = activation
         self.sinkhorn_n_iters = sinkhorn_n_iters
         self.expert_dropout = expert_dropout
+        self.traceable = traceable
 
         if self.selection_mode not in {"softmax", "sigmoid", "sinkmoid"}:
             raise ValueError(f"Unknown selection mode {self.selection_mode}")
 
-        self.keys = torch.nn.Parameter(torch.randn(self.n_experts, self.k_vec_dim, self.expert_size))
-        self.values = torch.nn.Parameter(torch.randn(self.n_experts, self.expert_size, self.v_dim))
-        self.expert_sel = torch.nn.Linear(in_features=self.k_vec_dim, out_features=self.n_experts, bias=False)
+        self.expert_sel = torch.nn.Linear(
+            in_features=self.k_vec_dim, out_features=self.n_experts, bias=False
+        )
 
-        if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(self.n_experts, self.expert_size))
-            self.o_bias = torch.nn.Parameter(torch.zeros(self.v_dim))
+        self._register_load_state_dict_pre_hook(
+            partial(load_state_dict_pre_hook, traceable=traceable)
+        )
+
+        if traceable:
+            self.keys = torch.nn.ModuleList(
+                [
+                    torch.nn.Linear(
+                        in_features=self.k_vec_dim,
+                        out_features=self.expert_size,
+                        bias=bias,
+                    )
+                    for _ in range(self.n_experts)
+                ]
+            )
+            self.values = torch.nn.ModuleList(
+                [
+                    torch.nn.Linear(
+                        in_features=self.expert_size,
+                        out_features=self.k_vec_dim,
+                        bias=False,
+                    )
+                    for _ in range(self.n_experts)
+                ]
+            )
+            if bias:
+                self.o_bias = torch.nn.Parameter(zeros(self.v_dim))
+            else:
+                self.o_bias = None
         else:
-            self.bias = None
-            self.o_bias = None
+            self.keys = torch.nn.Parameter(
+                randn(self.n_experts, self.k_vec_dim, self.expert_size)
+            )
+            self.values = torch.nn.Parameter(
+                randn(self.n_experts, self.expert_size, self.v_dim)
+            )
+            if bias:
+                self.bias = torch.nn.Parameter(zeros(self.n_experts, self.expert_size))
+                self.o_bias = torch.nn.Parameter(zeros(self.v_dim))
+            else:
+                self.bias = None
+                self.o_bias = None
 
     def renorm_keep_std(self, weight: torch.Tensor, dim: int = 0):
         with torch.no_grad():
@@ -127,7 +242,12 @@ class SigmaMoELayer(torch.nn.Module):
         sel = log_mean(sel, -2)
         return -entropy_l(sel).mean()
 
-    def cvmm_wrapper(self, inputs: torch.Tensor, sel_indices: Union[CVMMSel, torch.Tensor], weights: torch.Tensor):
+    def cvmm_wrapper(
+        self,
+        inputs: torch.Tensor,
+        sel_indices: Union[CVMMSel, torch.Tensor],
+        weights: torch.Tensor,
+    ):
         """
         TODO
 
@@ -141,16 +261,39 @@ class SigmaMoELayer(torch.nn.Module):
         """
         return cvmm(inputs, sel_indices, weights)
 
-    def compute_scores(
-        self, input: torch.Tensor, index: Union[CVMMSel, torch.Tensor], expert_scores: Optional[torch.Tensor] = None
+    def compute_scores_traceable(
+        self, inp: torch.Tensor, index: torch.Tensor
     ) -> torch.Tensor:
-        IS_CUDA = input.is_cuda
+        
+        bsz, seq_len, d_model = inp.shape
+        scores = torch.zeros((bsz, seq_len, self.expert_size)).to(inp.device)
+        scores = scores.view(-1, self.expert_size)
+        index, sorting_indices = index.view(-1).sort()
+        inp = inp.view(-1, d_model)
+        for expert_idx in range(self.n_experts):
+            tokens = inp[sorting_indices[index == expert_idx]]
+            if tokens.numel() > 0:
+                scores[sorting_indices[index == expert_idx]] = self.keys[expert_idx](
+                    tokens
+                )
+        scores = scores.view(bsz, seq_len, self.expert_size)
+        scores = F.relu(scores)
+        
+        return scores
+
+    def compute_scores(
+        self,
+        inp: torch.Tensor,
+        index: Union[CVMMSel, torch.Tensor],
+        expert_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        IS_CUDA = inp.is_cuda
         if IS_CUDA:
-            scores = self.cvmm_wrapper(input, index, self.keys)
+            scores = self.cvmm_wrapper(inp, index, self.keys)
             if self.bias is not None:
                 scores = scores + self.bias[index.raw_sel]
         else:
-            scores = index * F.linear(input, self.keys, None)
+            scores = index * F.linear(inp, self.keys, None)
             if self.bias is not None:
                 scores = scores + index * self.bias
 
@@ -184,8 +327,8 @@ class SigmaMoELayer(torch.nn.Module):
         # Based on https://arxiv.org/abs/2202.01169. Unnormalized verison
         A, B = x.shape[-2:]
 
-        a = torch.zeros_like(x[..., 0, :])
-        b = torch.zeros_like(x[..., 0])
+        a = zeros_like(x[..., 0, :])
+        b = zeros_like(x[..., 0])
 
         for _ in range(self.sinkhorn_n_iters):
             b = math.log(A) - (x - a[..., None, :]).logsumexp(-1)
@@ -199,21 +342,41 @@ class SigmaMoELayer(torch.nn.Module):
     def create_index(self, index: torch.Tensor) -> torch.Tensor:
         bs, seq_len = index.shape
         one_hot = torch.nn.functional.one_hot(index, num_classes=self.n_experts)
-        return one_hot.unsqueeze(-1).expand(bs, seq_len, self.n_experts, self.expert_size).reshape((bs, seq_len, -1))
+        return (
+            one_hot.unsqueeze(-1)
+            .expand(bs, seq_len, self.n_experts, self.expert_size)
+            .reshape((bs, seq_len, -1))
+        )
 
-    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        IS_CUDA = input.is_cuda
-        if not IS_CUDA:
+    def forward(self, inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # control flow variables
+        use_triton_kernel = TRITON_AVAIL and inp.is_cuda
+        use_cuda_kernel = not use_triton_kernel and inp.is_cuda and not self.traceable
+        use_fast_cpu = (
+            not use_cuda_kernel and not use_triton_kernel and not self.traceable
+        )
+        if self.traceable:
+            use_cuda_kernel = False
+            use_triton_kernel = False
+            use_fast_cpu = False
+
+        if use_fast_cpu:
             if self.keys.ndim > 2:
                 self.keys.data = torch.reshape(
-                    self.keys.transpose(1, 2), (int(self.n_experts * self.expert_size), self.k_vec_dim)
+                    self.keys.transpose(1, 2),
+                    (int(self.n_experts * self.expert_size), self.k_vec_dim),
                 )
             if self.values.ndim > 2:
                 self.values.data = torch.reshape(
-                    self.values, (int(self.n_experts * self.expert_size), self.k_vec_dim)
+                    self.values,
+                    (int(self.n_experts * self.expert_size), self.k_vec_dim),
                 ).T
+            if self.bias.ndim > 1:
+                self.bias.data = torch.reshape(
+                    self.bias, (int(self.n_experts * self.expert_size),)
+                )
 
-        sel = sel_raw = self.expert_sel(input)
+        sel = sel_raw = self.expert_sel(inp)
         reg_loss = self.entropy_reg(sel_raw)
 
         # Selection activation and topk
@@ -237,22 +400,30 @@ class SigmaMoELayer(torch.nn.Module):
         if self.activation_after_topk or (self.selection_mode == "sinkmoid"):
             sel_val = torch.gather(sel_raw, -1, sel_index)
             # for sinkmoid, the score is always calculated by a sigmoid
-            sel_val = torch.sigmoid(sel_val) if self.selection_mode == "sinkmoid" else self.sel_activation(sel_val)
+            sel_val = (
+                torch.sigmoid(sel_val)
+                if self.selection_mode == "sinkmoid"
+                else self.sel_activation(sel_val)
+            )
 
         # Preprocess the selection indices. They will be needed for both layers and save some time
-        if IS_CUDA:
-            if IS_TRITON:
+        if use_cuda_kernel or use_triton_kernel:
+            if use_triton_kernel:
                 sel_indices = cvmm_prepare_sel2(sel_index.int())
             else:
                 sel_indices = [
-                    cvmm_prepare_sel(sel_index[..., h].int(), self.n_experts) for h in range(sel_index.shape[-1])
+                    cvmm_prepare_sel(sel_index[..., h].int(), self.n_experts)
+                    for h in range(sel_index.shape[-1])
                 ]
-        else:
-            sel_indices = [self.create_index(sel_index[..., h].long()) for h in range(sel_index.shape[-1])]
+        elif use_fast_cpu:
+            sel_indices = [
+                self.create_index(sel_index[..., h].long())
+                for h in range(sel_index.shape[-1])
+            ]
 
-        if IS_CUDA and IS_TRITON:
+        if use_triton_kernel:
             # "Up-projection" layer for each head
-            scores = self.compute_scores(input, sel_indices)
+            scores = self.compute_scores(inp, sel_indices)
 
             # Down projection layer for each head
             sel_indices = sel_indices.clone()
@@ -260,24 +431,43 @@ class SigmaMoELayer(torch.nn.Module):
             sel_indices.sel_index = sel_indices.out_index
             sel_indices.out_index = None
             out = self.cvmm_wrapper(scores, sel_indices, self.values)
-            res = out.view(*input.shape[:-1], self.v_dim)
-        else:
+            res = out.view(*inp.shape[:-1], self.v_dim)
+        elif use_cuda_kernel or use_fast_cpu:
             # "Up-projection" layer for each head
             scores_l = [
-                self.compute_scores(input, sel_indices[h], sel_val[..., h]) for h in range(sel_index.shape[-1])
+                self.compute_scores(inp, sel_indices[h], sel_val[..., h])
+                for h in range(sel_index.shape[-1])
             ]
             # Down projection layer for each head
-            if IS_CUDA:
-                out = 0
-                for hi, scores in zip(sel_indices, scores_l):
-                    out = out + self.cvmm_wrapper(scores, hi, self.values)
-                res = out.view(*input.shape[:-1], self.v_dim)
-            else:
-                res = 0
-                for scores in scores_l:
-                    # we don't need to mask with the indices here since the
-                    # hidden activations of the non-used experts are zero
-                    res = res + F.linear(scores, self.values, None)
+            res = 0
+            for scores in scores_l:
+                # we don't need to mask with the indices here since the
+                # hidden activations of the non-used experts are zero
+                res = res + F.linear(scores, self.values, None)
+        else:
+            # traceable
+            scores_l = [
+                self.compute_scores_traceable(inp, sel_index[..., h].long())
+                for h in range(sel_index.shape[-1])
+            ]
+
+            # Down projection layer for each head
+            res = torch.zeros_like(inp)
+            bsz, seq_len, d_model = inp.shape
+            res = res.view(-1, d_model)
+            for h, scores in enumerate(scores_l):
+                scores = scores.view(-1, self.expert_size)
+                sel_index_h = sel_index[..., h].view(-1)
+                sel_val_h = sel_val[..., h].view(-1)
+                sel_index_h, sort_indices = sel_index_h.sort()
+                for expert_idx in range(self.n_experts):
+                    tgt_ind = sort_indices[sel_index_h == expert_idx]
+                    tokens = scores[tgt_ind]
+                    res[tgt_ind] = res[tgt_ind] + sel_val_h[tgt_ind].unsqueeze(
+                        -1
+                    ) * self.values[expert_idx](tokens)
+
+            res = res.view(bsz, seq_len, d_model)
 
         if self.o_bias is not None:
             res = res + self.o_bias

@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss, Linear
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -238,8 +238,8 @@ class SigmaMoEDenseActDense(torch.nn.Module):
     def __init__(self, config: SigmaMoEConfiguration):
         super().__init__()
         self.dropout = torch.nn.Dropout(config.moe_dropout)
-        self.wi = torch.nn.Linear(config.d_model, config.d_ff, bias=config.moe_bias)
-        self.wo = torch.nn.Linear(config.d_ff, config.d_model, bias=config.moe_bias)
+        self.wi = Linear(config.d_model, config.d_ff, bias=config.moe_bias)
+        self.wo = Linear(config.d_ff, config.d_model, bias=config.moe_bias)
         self.act = ACT2FN[config.activation]
 
     def forward(self, hidden_states):
@@ -269,6 +269,7 @@ class SigmaMoEFeedForwardLayer(torch.nn.Module):
                 v_dim=config.v_dim,
                 sinkhorn_n_iters=config.sinkhorn_n_iters,
                 expert_dropout=config.expert_dropout,
+                traceable=config.traceable,
             )
         else:
             self.ff = SigmaMoEDenseActDense(config)
@@ -318,10 +319,10 @@ class SigmaMoEAttention(torch.nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.query_key_value = torch.nn.Linear(
+        self.query_key_value = Linear(
             self.hidden_size, 3 * self.hidden_size, bias=True
         )
-        self.dense = torch.nn.Linear(
+        self.dense = Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=True
         )
         self.qk_layernorm = config.qk_layernorm
@@ -865,7 +866,7 @@ class SigmaMoEPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         self.config: SigmaMoEConfiguration
-        if isinstance(module, torch.nn.Linear):
+        if isinstance(module, Linear):
             std = 2.0 / math.sqrt(
                 module.weight.size(-1) * self.config.num_hidden_layers
             )
@@ -888,15 +889,22 @@ class SigmaMoEPreTrainedModel(PreTrainedModel):
             std_values = 2.0 / math.sqrt(
                 self.config.d_ff * self.config.num_hidden_layers
             )
-            module.expert_sel: torch.nn.Linear
+            module.expert_sel: Linear
             module.expert_sel.weight.data.normal_(mean=0.0, std=std_expert_sel)
             # module.renorm_keep_std(module.expert_sel.weight, dim=1)
-            module.keys.data.normal_(mean=0.0, std=std_keys)
-            module.values.data.normal_(mean=0.0, std=std_values)
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.o_bias is not None:
-                module.o_bias.data.zero_()
+            if self.config.traceable:
+                k: Linear
+                v: Linear
+                for k, v in zip(module.keys, module.values):
+                    k.weight.data.normal_(mean=0.0, std=std_keys)
+                    v.weight.data.normal_(mean=0.0, std=std_values)
+            else:
+                module.keys.data.normal_(mean=0.0, std=std_keys)
+                module.values.data.normal_(mean=0.0, std=std_values)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+                if module.o_bias is not None:
+                    module.o_bias.data.zero_()
 
 
 SIGMA_MOE_INPUTS_DOCSTRING = r"""
@@ -1561,7 +1569,7 @@ class SigmaMoEForTokenClassification(SigmaMoEPreTrainedModel):
         else:
             classifier_dropout = 0.1
         self.dropout = torch.nn.Dropout(classifier_dropout)
-        self.classifier = torch.nn.Linear(config.d_model, config.num_labels)
+        self.classifier = Linear(config.d_model, config.num_labels)
 
         # Initialize weights and apply final processing
         self.post_init()
