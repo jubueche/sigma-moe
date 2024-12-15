@@ -162,6 +162,8 @@ class SigmaMoELayer(torch.nn.Module):
         sinkhorn_n_iters: int = 3,
         expert_dropout: float = 0.0,
         traceable: bool = False,
+        approximate: bool = False,
+        bucket_size: int = 128,
     ):
         super().__init__()
         self.k_dim = d_model
@@ -178,6 +180,9 @@ class SigmaMoELayer(torch.nn.Module):
         self.sinkhorn_n_iters = sinkhorn_n_iters
         self.expert_dropout = expert_dropout
         self.traceable = traceable
+        self.approximate = approximate
+        self.bucket_size = bucket_size
+        self.n_buckets = math.ceil(self.n_experts / bucket_size)
 
         if self.selection_mode not in {"softmax", "sigmoid", "sinkmoid"}:
             raise ValueError(f"Unknown selection mode {self.selection_mode}")
@@ -371,7 +376,7 @@ class SigmaMoELayer(torch.nn.Module):
                     self.values,
                     (int(self.n_experts * self.expert_size), self.k_vec_dim),
                 ).T
-            if self.bias.ndim > 1:
+            if self.bias is not None and self.bias.ndim > 1:
                 self.bias.data = torch.reshape(
                     self.bias, (int(self.n_experts * self.expert_size),)
                 )
@@ -394,8 +399,19 @@ class SigmaMoELayer(torch.nn.Module):
         #     [0.69,0.42] are the scores
         # Example: sel_index[1,3,:] are the indices (ordered) of token 4 of sequence 2
         #     [2,1] are the indices
+        if self.approximate:
+            sel_val, sel_index = torch.stack(
+                sel.chunk(self.n_buckets, dim=-1), dim=-1
+            ).topk(self.n_heads // self.n_buckets, dim=-2, sorted=False)
+            sel_index += torch.arange(self.n_buckets) * self.bucket_size
+            sel_index = sel_index.flatten(start_dim=-2)
+            sel_val = sel_val.flatten(start_dim=-2)
 
-        sel_val, sel_index = sel.topk(self.n_heads, dim=-1, sorted=False)
+            # debug the overlap
+            # _, sel_index_correct = sel.topk(self.n_heads, dim=-1, sorted=False)
+            # coverage = torch.isin(sel_index, sel_index_correct).float().mean(-1)
+        else:
+            sel_val, sel_index = sel.topk(self.n_heads, dim=-1, sorted=False)
 
         if self.activation_after_topk or (self.selection_mode == "sinkmoid"):
             sel_val = torch.gather(sel_raw, -1, sel_index)
