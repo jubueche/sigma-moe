@@ -183,6 +183,8 @@ class SigmaMoELayer(torch.nn.Module):
         self.approximate = approximate
         self.bucket_size = bucket_size
         self.n_buckets = math.ceil(self.n_experts / bucket_size)
+        if approximate:
+            assert k % self.n_buckets == 0, "top-k must be divisible by num buckets, which is ceil(E / bucket size)"
 
         if self.selection_mode not in {"softmax", "sigmoid", "sinkmoid"}:
             raise ValueError(f"Unknown selection mode {self.selection_mode}")
@@ -218,8 +220,10 @@ class SigmaMoELayer(torch.nn.Module):
             )
             if bias:
                 self.o_bias = torch.nn.Parameter(zeros(self.v_dim))
+                self.bias = None
             else:
                 self.o_bias = None
+                self.bias = None
         else:
             self.keys = torch.nn.Parameter(
                 randn(self.n_experts, self.k_vec_dim, self.expert_size)
@@ -231,8 +235,8 @@ class SigmaMoELayer(torch.nn.Module):
                 self.bias = torch.nn.Parameter(zeros(self.n_experts, self.expert_size))
                 self.o_bias = torch.nn.Parameter(zeros(self.v_dim))
             else:
-                self.bias = None
                 self.o_bias = None
+                self.bias = None
 
     def renorm_keep_std(self, weight: torch.Tensor, dim: int = 0):
         with torch.no_grad():
@@ -271,7 +275,11 @@ class SigmaMoELayer(torch.nn.Module):
     ) -> torch.Tensor:
         
         bsz, seq_len, d_model = inp.shape
-        scores = torch.zeros((bsz, seq_len, self.expert_size)).to(inp.device)
+        scores = torch.zeros(
+            (bsz, seq_len, self.expert_size),
+            device=inp.device,
+            dtype=inp.dtype
+        )
         scores = scores.view(-1, self.expert_size)
         index, sorting_indices = index.view(-1).sort()
         inp = inp.view(-1, d_model)

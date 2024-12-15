@@ -25,7 +25,7 @@ def test_approximate_top_k():
     config = SigmaMoEConfiguration(
         d_model=d_model,
         n_experts=n_experts,
-        top_k=top_k,
+        top_k_experts=top_k,
         num_hidden_layers=1,
         d_ff=int(4*d_model),
         approximate=True,
