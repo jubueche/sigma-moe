@@ -271,6 +271,7 @@ class SigmaMoEFeedForwardLayer(torch.nn.Module):
                 expert_dropout=config.expert_dropout,
                 traceable=config.traceable,
                 approximate=config.approximate,
+                triton_approximate=config.triton_approximate,
                 bucket_size=config.bucket_size
             )
         else:

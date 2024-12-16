@@ -42,6 +42,10 @@ except ImportError:
             "GPU not available. Falling back to CPU verison of the MoE layer, which is equally fast as a dense layer."
         )
     from .cuda_src import CVMMSel, cvmm, cvmm_prepare_sel
+except RuntimeError as e:
+    print(f"Error importing triton:\n{e}")
+    print("Trying to import fast router code")
+    from .triton_src import ApproximateTopkRouter
 
 
 def dist_logsumexp(x: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
@@ -163,6 +167,7 @@ class SigmaMoELayer(torch.nn.Module):
         expert_dropout: float = 0.0,
         traceable: bool = False,
         approximate: bool = False,
+        triton_approximate: bool = False,
         bucket_size: int = 128,
     ):
         super().__init__()
@@ -181,6 +186,7 @@ class SigmaMoELayer(torch.nn.Module):
         self.expert_dropout = expert_dropout
         self.traceable = traceable
         self.approximate = approximate
+        self.triton_approximate = triton_approximate
         self.bucket_size = bucket_size
         self.n_buckets = math.ceil(self.n_experts / bucket_size)
         if approximate:
@@ -244,17 +250,25 @@ class SigmaMoELayer(torch.nn.Module):
             weight.div_(weight.norm(dim=dim, keepdim=True))
             weight.mul_(std / weight.std())
 
-    def entropy_reg(self, sel: torch.Tensor) -> float:
+    def entropy_reg(self, sel: torch.Tensor, is_softmaxed: bool = False) -> float:
         # Everything is done in log scale
         sel = sel.flatten(0, -2)
-        sel = F.log_softmax(sel, dim=-1)
+        
+        # reverse the softmax
+        if is_softmaxed:
+            # this is e^{raw-router-logits}
+            sel = (sel / (1 - sel)).clamp_min(1e-6)
+            # this is the log-softmax
+            sel = (sel / sel.sum(dim=-1, keepdim=True)).log()
+        else:
+            sel = F.log_softmax(sel, dim=-1)
         sel = log_mean(sel, -2)
         return -entropy_l(sel).mean()
 
     def cvmm_wrapper(
         self,
         inputs: torch.Tensor,
-        sel_indices: Union[CVMMSel, torch.Tensor],
+        sel_indices: Union["CVMMSel", torch.Tensor],
         weights: torch.Tensor,
     ):
         """
@@ -297,7 +311,7 @@ class SigmaMoELayer(torch.nn.Module):
     def compute_scores(
         self,
         inp: torch.Tensor,
-        index: Union[CVMMSel, torch.Tensor],
+        index: Union["CVMMSel", torch.Tensor],
         expert_scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         IS_CUDA = inp.is_cuda
@@ -389,37 +403,53 @@ class SigmaMoELayer(torch.nn.Module):
                     self.bias, (int(self.n_experts * self.expert_size),)
                 )
 
-        sel = sel_raw = self.expert_sel(inp)
-        reg_loss = self.entropy_reg(sel_raw)
-
-        # Selection activation and topk
-        if (not self.activation_after_topk) or (self.selection_mode == "sinkmoid"):
-            # Sinkhorn should be always applied before top-k
-            sel = self.sel_activation(sel)
-
-        if self.training and self.expert_dropout > 0:
-            mask = torch.rand_like(sel) < self.expert_dropout
-            sel = sel.masked_fill(mask, float("-inf"))
-
-        # sel val and sel_index have shape (bs, seq_len, n_heads)
-        # where n_heads is the number of experts we select
-        # Example: sel_val[1,3,:] are the scores (ordered) of token 4 of sequence 2
-        #     [0.69,0.42] are the scores
-        # Example: sel_index[1,3,:] are the indices (ordered) of token 4 of sequence 2
-        #     [2,1] are the indices
-        if self.approximate:
-            sel_val, sel_index = torch.stack(
-                sel.chunk(self.n_buckets, dim=-1), dim=-1
-            ).topk(self.n_heads // self.n_buckets, dim=-2, sorted=False)
-            sel_index += torch.arange(self.n_buckets) * self.bucket_size
-            sel_index = sel_index.flatten(start_dim=-2)
-            sel_val = sel_val.flatten(start_dim=-2)
-
-            # debug the overlap
-            # _, sel_index_correct = sel.topk(self.n_heads, dim=-1, sorted=False)
-            # coverage = torch.isin(sel_index, sel_index_correct).float().mean(-1)
+        # use the fused router with approx top-k
+        if self.approximate and self.triton_approximate:
+            assert self.expert_dropout <= 0, "Expert dropout not supported for this mode"
+            assert not self.activation_after_topk, "Act. after top-k not supported for fast triton"
+            sel_raw, sel_val, sel_index = ApproximateTopkRouter.apply(
+                inp, self.expert_sel.weight, self.bucket_size, self.n_heads, self.n_experts, self.training
+            )
+            if self.training:
+                reg_loss = self.entropy_reg(sel_raw, is_softmaxed=True)
+            else:
+                # we don't need the loss during inference
+                reg_loss = torch.tensor(0.0).to(device=inp.device, dtype=inp.dtype)
         else:
-            sel_val, sel_index = sel.topk(self.n_heads, dim=-1, sorted=False)
+            sel = sel_raw = self.expert_sel(inp)
+            reg_loss = self.entropy_reg(sel_raw)
+
+            # Selection activation and topk
+            if (not self.activation_after_topk) or (self.selection_mode == "sinkmoid"):
+                # Sinkhorn should be always applied before top-k
+                sel = self.sel_activation(sel)
+
+            if self.training and self.expert_dropout > 0:
+                mask = torch.rand_like(sel) < self.expert_dropout
+                sel = sel.masked_fill(mask, float("-inf"))
+
+            # sel val and sel_index have shape (bs, seq_len, n_heads)
+            # where n_heads is the number of experts we select
+            # Example: sel_val[1,3,:] are the scores (ordered) of token 4 of sequence 2
+            #     [0.69,0.42] are the scores
+            # Example: sel_index[1,3,:] are the indices (ordered) of token 4 of sequence 2
+            #     [2,1] are the indices
+            if self.approximate:
+                sel_val, sel_index = torch.stack(
+                    sel.chunk(self.n_buckets, dim=-1), dim=-1
+                ).topk(self.n_heads // self.n_buckets, dim=-2, sorted=False)
+                sel_index += torch.arange(self.n_buckets) * self.bucket_size
+                # technically, the transpose is not necessary. it just
+                # aligns the local top-k next to each other.
+                # probably faster to remove them
+                sel_index = sel_index.transpose(-2, -1).flatten(start_dim=-2)
+                sel_val = sel_val.transpose(-2, -1).flatten(start_dim=-2)
+
+                # debug the overlap
+                # _, sel_index_correct = sel.topk(self.n_heads, dim=-1, sorted=False)
+                # coverage = torch.isin(sel_index, sel_index_correct).float().mean(-1)
+            else:
+                sel_val, sel_index = sel.topk(self.n_heads, dim=-1, sorted=False)
 
         if self.activation_after_topk or (self.selection_mode == "sinkmoid"):
             sel_val = torch.gather(sel_raw, -1, sel_index)

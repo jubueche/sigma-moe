@@ -4,6 +4,8 @@ from sigma_moe import SigmaMoEForCausalLM, SigmaMoEConfiguration
 
 
 def test_approximate_top_k():
+    torch.manual_seed(0)
+    
     d_model = 1024
     n_experts = 1024
     top_k = 16
@@ -14,10 +16,11 @@ def test_approximate_top_k():
         n_experts=n_experts,
         expert_size=2,
         k=top_k,
-        bias=True,
         approximate=True,
+        triton_approximate=True,
         bucket_size=128
     )
+    layer.eval()
 
     input = torch.randn(bsz, 10, d_model)
     layer(input)
@@ -29,6 +32,7 @@ def test_approximate_top_k():
         num_hidden_layers=1,
         d_ff=int(4*d_model),
         approximate=True,
+        triton_approximate=True,
         bucket_size=128
     )
     moe = SigmaMoEForCausalLM(config=config)
