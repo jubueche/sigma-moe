@@ -193,8 +193,9 @@ class SigmaMoELayer(torch.nn.Module):
         self.approximate = approximate
         self.triton_approximate = triton_approximate
         
-        self.bucket_size = n_experts / k
-        self.n_buckets = n_experts / self.bucket_size
+        assert n_experts % k == 0, "Num experts must be divisible by top-k"
+        self.bucket_size = n_experts // k
+        self.n_buckets = n_experts // self.bucket_size
 
         assert self.bucket_size >= 16, "Too small bucket size. Your n_experts must be at least 16x higher than your k"
         
