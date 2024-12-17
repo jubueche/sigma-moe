@@ -272,7 +272,6 @@ class SigmaMoEFeedForwardLayer(torch.nn.Module):
                 traceable=config.traceable,
                 approximate=config.approximate,
                 triton_approximate=config.triton_approximate,
-                bucket_size=config.bucket_size
             )
         else:
             self.ff = SigmaMoEDenseActDense(config)

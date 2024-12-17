@@ -47,7 +47,6 @@ class SigmaMoEConfiguration(PretrainedConfig):
         traceable: bool = False,
         approximate: bool = False,
         triton_approximate: bool = False,
-        bucket_size: int = 128,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -93,7 +92,6 @@ class SigmaMoEConfiguration(PretrainedConfig):
         self.traceable = traceable
         self.approximate = approximate
         self.triton_approximate = triton_approximate
-        self.bucket_size = bucket_size
 
         self._rope_scaling_validation()
 

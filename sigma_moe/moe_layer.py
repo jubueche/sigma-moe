@@ -23,6 +23,7 @@ def is_at_least_volta_gpu():
 
 
 TRITON_AVAIL = False
+HAS_APPROX_TOP_K = False
 try:
     from .triton_src import CVMMSel, cvmm, cvmm_prepare_sel2
 
@@ -46,6 +47,11 @@ except RuntimeError as e:
     print(f"Error importing triton:\n{e}")
     print("Trying to import fast router code")
     from .triton_src import ApproximateTopkRouter
+    HAS_APPROX_TOP_K = True
+
+if not HAS_APPROX_TOP_K:
+    from .triton_src import ApproximateTopkRouter
+    HAS_APPROX_TOP_K = True
 
 
 def dist_logsumexp(x: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
@@ -168,7 +174,6 @@ class SigmaMoELayer(torch.nn.Module):
         traceable: bool = False,
         approximate: bool = False,
         triton_approximate: bool = False,
-        bucket_size: int = 128,
     ):
         super().__init__()
         self.k_dim = d_model
@@ -187,8 +192,12 @@ class SigmaMoELayer(torch.nn.Module):
         self.traceable = traceable
         self.approximate = approximate
         self.triton_approximate = triton_approximate
-        self.bucket_size = bucket_size
-        self.n_buckets = math.ceil(self.n_experts / bucket_size)
+        
+        self.bucket_size = n_experts / k
+        self.n_buckets = n_experts / self.bucket_size
+
+        assert self.bucket_size >= 16, "Too small bucket size. Your n_experts must be at least 16x higher than your k"
+        
         if approximate:
             assert k % self.n_buckets == 0, "top-k must be divisible by num buckets, which is ceil(E / bucket size)"
 
@@ -407,6 +416,7 @@ class SigmaMoELayer(torch.nn.Module):
         if self.approximate and self.triton_approximate:
             assert self.expert_dropout <= 0, "Expert dropout not supported for this mode"
             assert not self.activation_after_topk, "Act. after top-k not supported for fast triton"
+            assert HAS_APPROX_TOP_K, "Could not import approximate top-k router in triton"
             sel_raw, sel_val, sel_index = ApproximateTopkRouter.apply(
                 inp, self.expert_sel.weight, self.bucket_size, self.n_heads, self.n_experts, self.training
             )
@@ -438,7 +448,7 @@ class SigmaMoELayer(torch.nn.Module):
                 sel_val, sel_index = torch.stack(
                     sel.chunk(self.n_buckets, dim=-1), dim=-1
                 ).topk(self.n_heads // self.n_buckets, dim=-2, sorted=False)
-                sel_index += torch.arange(self.n_buckets) * self.bucket_size
+                sel_index += torch.arange(self.n_buckets, device=sel.device) * self.bucket_size
                 # technically, the transpose is not necessary. it just
                 # aligns the local top-k next to each other.
                 # probably faster to remove them

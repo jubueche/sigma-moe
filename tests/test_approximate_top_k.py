@@ -6,6 +6,9 @@ from sigma_moe import SigmaMoEForCausalLM, SigmaMoEConfiguration
 def test_approximate_top_k():
     torch.manual_seed(0)
     
+    dtype = torch.float16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     d_model = 1024
     n_experts = 1024
     top_k = 16
@@ -18,11 +21,11 @@ def test_approximate_top_k():
         k=top_k,
         approximate=True,
         triton_approximate=True,
-        bucket_size=128
     )
+    layer.to(device=device, dtype=dtype)
     layer.eval()
 
-    input = torch.randn(bsz, 10, d_model)
+    input = torch.randn(bsz, 10, d_model, dtype=dtype, device=device)
     layer(input)
 
     config = SigmaMoEConfiguration(
@@ -33,11 +36,11 @@ def test_approximate_top_k():
         d_ff=int(4*d_model),
         approximate=True,
         triton_approximate=True,
-        bucket_size=128
     )
     moe = SigmaMoEForCausalLM(config=config)
+    moe.to(device=device, dtype=dtype)
     token_ids = torch.randint(low=0, high=10000, size=(bsz, 10))
-    attn_mask = torch.ones((bsz, 10))
+    attn_mask = torch.ones((bsz, 10), dtype=dtype)
     moe(token_ids, attn_mask)
 
 
