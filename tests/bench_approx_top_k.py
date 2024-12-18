@@ -12,7 +12,6 @@ def get_layer(
     n_experts,
     expert_size,
     top_k,
-    bucket_size,
     training,
     device,
     dtype,
@@ -25,7 +24,6 @@ def get_layer(
         k=top_k,
         approximate=approximate,
         triton_approximate=triton_approximate,
-        bucket_size=bucket_size,
     ).to(device=device, dtype=dtype)
     if not training:
         layer.eval()
@@ -36,17 +34,17 @@ def get_layer(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["n_experts"],  # The varying dimension
-        x_vals=[2**i for i in range(14, 18)],
+        x_vals=[2**i for i in range(11, 15)],
         line_arg="mode",  # The mode we compare
         line_vals=[
             "non_approximate",
             "approximate_no_triton",
-            # "approximate_with_triton"
+            "approximate_with_triton"
         ],
         line_names=[
             "Non-Approximate",
             "Approximate (Triton Disabled)",
-            # "Approximate (Triton Enabled)"
+            "Approximate (Triton Enabled)"
         ],
         ylabel="Time per forward pass (s)",
         plot_name="sigma_moe_benchmark",
@@ -59,7 +57,7 @@ def benchmark(n_experts, mode):
     """
     # Define constants
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16
+    dtype = torch.float32
 
     d_model = 128
     context_length = 8192
@@ -68,8 +66,6 @@ def benchmark(n_experts, mode):
     expert_size = 128
     top_k = 64
     training = False
-
-    bucket_size = int(n_experts / top_k)
 
     # Select mode configuration
     if mode == "non_approximate":
@@ -93,7 +89,6 @@ def benchmark(n_experts, mode):
         n_experts=n_experts,
         expert_size=expert_size,
         top_k=top_k,
-        bucket_size=bucket_size,
         training=training,
         device=device,
         dtype=dtype,

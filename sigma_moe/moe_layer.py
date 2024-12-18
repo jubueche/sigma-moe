@@ -197,7 +197,8 @@ class SigmaMoELayer(torch.nn.Module):
         self.bucket_size = n_experts // k
         self.n_buckets = n_experts // self.bucket_size
 
-        assert self.bucket_size >= 16, "Too small bucket size. Your n_experts must be at least 16x higher than your k"
+        if self.triton_approximate:
+            assert self.bucket_size >= 16, "Too small bucket size. Your n_experts must be at least 16x higher than your k"
         
         if approximate:
             assert k % self.n_buckets == 0, "top-k must be divisible by num buckets, which is ceil(E / bucket size)"
@@ -419,7 +420,7 @@ class SigmaMoELayer(torch.nn.Module):
             assert not self.activation_after_topk, "Act. after top-k not supported for fast triton"
             assert HAS_APPROX_TOP_K, "Could not import approximate top-k router in triton"
             sel_raw, sel_val, sel_index = ApproximateTopkRouter.apply(
-                inp, self.expert_sel.weight, self.bucket_size, self.n_heads, self.n_experts, self.training
+                inp, self.expert_sel.weight.T, self.bucket_size, self.n_heads, self.n_experts, self.training
             )
             if self.training:
                 reg_loss = self.entropy_reg(sel_raw, is_softmaxed=True)
@@ -446,10 +447,10 @@ class SigmaMoELayer(torch.nn.Module):
             # Example: sel_index[1,3,:] are the indices (ordered) of token 4 of sequence 2
             #     [2,1] are the indices
             if self.approximate:
-                sel_val, sel_index = torch.stack(
+                sel_val, sel_index_local = torch.stack(
                     sel.chunk(self.n_buckets, dim=-1), dim=-1
                 ).topk(self.n_heads // self.n_buckets, dim=-2, sorted=False)
-                sel_index += torch.arange(self.n_buckets, device=sel.device) * self.bucket_size
+                sel_index = sel_index_local + torch.arange(self.n_buckets, device=sel.device) * self.bucket_size
                 # technically, the transpose is not necessary. it just
                 # aligns the local top-k next to each other.
                 # probably faster to remove them
