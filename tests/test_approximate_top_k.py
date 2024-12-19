@@ -6,7 +6,7 @@ from sigma_moe import SigmaMoEForCausalLM, SigmaMoEConfiguration
 def test_approximate_top_k():
     torch.manual_seed(0)
     
-    dtype = torch.float32
+    dtype = torch.float16
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     d_model = 1024
