@@ -182,43 +182,44 @@ def kernel_matmul_sigmoid_topk(
 
         tl.store(c_ptrs, c, mask=c_mask)
 
-    sorted_vals = tl.max(c, axis=-1)
-    sorted_indices = tl.argmax(c, axis=-1)
-    sorted_indices = start_n + sorted_indices
 
-    offs_kb_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    top_k_address = stride_topk_m * offs_kb_m + stride_topk_k * pid_n
-    top_k_vals_ptrs = top_k_vals_ptr + top_k_address
-    top_k_inds_ptrs = top_k_inds_ptr + top_k_address
-    
-    top_k_mask = offs_kb_m < M
-    tl.store(top_k_vals_ptrs, sorted_vals, mask=top_k_mask)
-    tl.store(top_k_inds_ptrs, sorted_indices, mask=top_k_mask)
+    if kb == 1:
+        ##### Assumung local k is 1 #####
+        sorted_vals, sorted_indices = tl.max(c.to(tl.float32), return_indices=True, axis=-1)
+        sorted_indices = start_n + sorted_indices
 
+        offs_kb_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        top_k_address = stride_topk_m * offs_kb_m + stride_topk_k * pid_n
+        top_k_vals_ptrs = top_k_vals_ptr + top_k_address
+        top_k_inds_ptrs = top_k_inds_ptr + top_k_address
+        
+        top_k_mask = offs_kb_m < M
+        tl.store(top_k_vals_ptrs, sorted_vals, mask=top_k_mask)
+        tl.store(top_k_inds_ptrs, sorted_indices, mask=top_k_mask)
+    else:
+        ids = tl.broadcast_to(
+            tl.arange(0, BLOCK_SIZE_N)[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        )
+        sorted_vals, sorted_indices = argsort(c, ids, descending=True)
 
-    # ids = tl.broadcast_to(
-    #     tl.arange(0, BLOCK_SIZE_N)[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
-    # )
-    # sorted_vals, sorted_indices = argsort(c, ids, descending=True)
+        # we need to offset the indices by the block-id
+        sorted_indices = start_n + sorted_indices
 
-    # # we need to offset the indices by the block-id
-    # sorted_indices = start_n + sorted_indices
+        offs_kb_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_kb_k = tl.arange(0, BLOCK_SIZE_N)
+        moved_k_offs = pid_n * kb + offs_kb_k
 
-    # offs_kb_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    # offs_kb_k = tl.arange(0, BLOCK_SIZE_N)
-    # moved_k_offs = pid_n * kb + offs_kb_k
+        top_k_address = (
+            stride_topk_m * offs_kb_m[:, None]
+            + stride_topk_k * moved_k_offs[None, :]
+        )
+        top_k_vals_ptrs = top_k_vals_ptr + top_k_address
+        top_k_inds_ptrs = top_k_inds_ptr + top_k_address
+        top_k_mask = (offs_kb_m[:, None] < M) & (offs_kb_k[None, :] < kb)
 
-    # top_k_address = (
-    #     stride_topk_m * offs_kb_m[:, None]
-    #     + stride_topk_k * moved_k_offs[None, :]
-    # )
-    # top_k_vals_ptrs = top_k_vals_ptr + top_k_address
-    # top_k_inds_ptrs = top_k_inds_ptr + top_k_address
-    # top_k_mask = (offs_kb_m[:, None] < M) & (offs_kb_k[None, :] < kb)
-
-    # sorted_indices = sorted_indices.to(tl.float32)
-    # tl.store(top_k_vals_ptrs, sorted_vals, mask=top_k_mask)
-    # tl.store(top_k_inds_ptrs, sorted_indices, mask=top_k_mask)
+        sorted_indices = sorted_indices.to(tl.float32)
+        tl.store(top_k_vals_ptrs, sorted_vals, mask=top_k_mask)
+        tl.store(top_k_inds_ptrs, sorted_indices, mask=top_k_mask)
 
 
 def matmul_sigmoid_topk(a: Tensor, b: Tensor, bucket_size: int, k: int, n_experts: int, training: bool):
