@@ -196,10 +196,9 @@ class SigmaMoELayer(torch.nn.Module):
         assert n_experts % k == 0, "Num experts must be divisible by top-k"
         self.bucket_size = n_experts // k
         self.n_buckets = n_experts // self.bucket_size
-
-        assert self.bucket_size >= 16, "Too small bucket size. Your n_experts must be at least 16x higher than your k"
         
         if approximate:
+            assert self.bucket_size >= 16, "Too small bucket size. Your n_experts must be at least 16x higher than your k"
             assert k % self.n_buckets == 0, "top-k must be divisible by num buckets, which is ceil(E / bucket size)"
 
         if self.selection_mode not in {"softmax", "sigmoid", "sinkmoid"}:
