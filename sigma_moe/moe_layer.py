@@ -50,8 +50,11 @@ except RuntimeError as e:
     HAS_APPROX_TOP_K = True
 
 if not HAS_APPROX_TOP_K:
-    from .triton_src import ApproximateTopkRouter
-    HAS_APPROX_TOP_K = True
+    try:
+        from .triton_src import ApproximateTopkRouter
+        HAS_APPROX_TOP_K = True
+    except Exception as e:
+        print(f"Could not load approximate top-k router: {e}")
 
 
 def dist_logsumexp(x: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
