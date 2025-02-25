@@ -531,10 +531,11 @@ class SigmaMoELayer(torch.nn.Module):
                 sel_index_h, sort_indices = sel_index_h.sort()
                 for expert_idx in range(self.n_experts):
                     tgt_ind = sort_indices[sel_index_h == expert_idx]
-                    tokens = scores[tgt_ind]
-                    res[tgt_ind] = res[tgt_ind] + sel_val_h[tgt_ind].unsqueeze(
-                        -1
-                    ) * self.values[expert_idx](tokens)
+                    if tgt_ind.numel() > 0:
+                        tokens = scores[tgt_ind]
+                        res[tgt_ind] = res[tgt_ind] + sel_val_h[tgt_ind].unsqueeze(
+                            -1
+                        ) * self.values[expert_idx](tokens)
 
             res = res.view(bsz, seq_len, d_model)
 
