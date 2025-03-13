@@ -45,6 +45,8 @@ class SigmaMoEConfiguration(PretrainedConfig):
         routing_regularization: float = 0.001,
         num_sparse_hidden_layers: int = None,
         traceable: bool = False,
+        approximate: bool = False,
+        triton_approximate: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -88,6 +90,8 @@ class SigmaMoEConfiguration(PretrainedConfig):
             # this will create no sparse layers
             self.sparse_step = -1
         self.traceable = traceable
+        self.approximate = approximate
+        self.triton_approximate = triton_approximate
 
         self._rope_scaling_validation()
 

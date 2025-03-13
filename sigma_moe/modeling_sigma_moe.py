@@ -270,6 +270,8 @@ class SigmaMoEFeedForwardLayer(torch.nn.Module):
                 sinkhorn_n_iters=config.sinkhorn_n_iters,
                 expert_dropout=config.expert_dropout,
                 traceable=config.traceable,
+                approximate=config.approximate,
+                triton_approximate=config.triton_approximate,
             )
         else:
             self.ff = SigmaMoEDenseActDense(config)
