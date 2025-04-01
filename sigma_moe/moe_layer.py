@@ -45,16 +45,12 @@ except (ImportError, ModuleNotFoundError):
     from .cuda_src import CVMMSel, cvmm, cvmm_prepare_sel
 except RuntimeError as e:
     print(f"Error importing triton:\n{e}")
-    print("Trying to import fast router code")
+
+try:
     from .triton_src import ApproximateTopkRouter
     HAS_APPROX_TOP_K = True
-
-if not HAS_APPROX_TOP_K:
-    try:
-        from .triton_src import ApproximateTopkRouter
-        HAS_APPROX_TOP_K = True
-    except Exception as e:
-        print(f"Could not load approximate top-k router: {e}")
+except Exception as e:
+    print(f"Could not load approximate top-k router: {e}")
 
 
 def dist_logsumexp(x: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
