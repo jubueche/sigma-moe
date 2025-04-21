@@ -312,7 +312,7 @@ class SigmaMoELayer(torch.nn.Module):
             keys = self.keys[expert_idx](tokens)
             scores = assign_keys(tokens, scores, keys, sorting_indices, index==expert_idx)  # control flow
         scores = scores.view(bsz, seq_len, self.expert_size)
-        scores = F.relu(scores)
+        scores = self.activation(scores)
         
         return scores
 
