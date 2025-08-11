@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+authors = [
+  {name = "Julian Büchel", email = "jub@zurich.ibm.com"}
+]
+maintainers = [
+  {name = "Julian Büchel", email = "jub@zurich.ibm.com"}
+]
+name = "sigmamoe"
+version = "0.1.0"
+description = "Transformers-like implementation of sigma-moe"
+requires-python = ">=3.9"
+readme = "README.md"
+
+dependencies = [
+    "torch",
+    "transformers"
+]
