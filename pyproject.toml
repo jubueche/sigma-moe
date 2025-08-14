@@ -12,7 +12,7 @@ maintainers = [
 name = "sigmamoe"
 version = "0.1.0"
 description = "Transformers-like implementation of sigma-moe"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 readme = "README.md"
 
 dependencies = [
